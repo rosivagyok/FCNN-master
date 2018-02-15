@@ -1,0 +1,189 @@
+function [ ] = fusion_demo( varargin )
+%% Fusion Run
+% This file will train a network using MDNet and TCNN pre-trained models
+
+% setting up fusion layers
+fusion = setFusionLayers();
+net =  insertBNLayers(fusion);
+% opts.train.batch_frames     = 256; % the number of frames to construct a minibatch.
+% opts.train.batchSize        = 256 ;
+% opts.train.batch_pos        = 56;
+% opts.train.batch_neg        = 200;
+% 
+% opts.train.numCycles        = 100 ; % #cycles (#iterations/#domains)
+% opts.train.useGpu           = true ;
+% opts.train.conserveMemory	= true ;
+% opts.train.learningRate     = 0.0001 ; % x10 for fc4-6
+% opts = vl_argparse(opts, varargin) ;
+
+opts.roiPath  = fullfile('matfiles', 'roidb.mat');
+opts.numEpochs = 75 ;
+opts.batchSize = 256 ;
+
+opts.sampling.crop_mode         = 'warp';
+opts.sampling.numFetchThreads   = 8 ;
+opts.sampling.posRange          = [0.7 1];
+opts.sampling.negRange          = [0 0.5];
+opts.sampling.input_size        = 107;
+opts.sampling.crop_padding      = 16;
+
+opts.sampling.posPerFrame       = 56;
+opts.sampling.negPerFrame       = 200;
+opts.sampling.scale_factor      = 1.05;
+opts.sampling.flip              = false;
+
+if exist(opts.roiPath,'file')
+    load(opts.roiPath) ;
+else
+    opts.seqsList = dir('/media/louise/0099A7425A60D41D/data_vot');
+    opts.dataPath = fullfile('/media/louise/0099A7425A60D41D/data_vot');
+   
+    roidb = setup_data('/media/louise/0099A7425A60D41D/data_vot',opts.sampling);
+    save(opts.roiPath, 'roidb') ;
+end
+opts = vl_argparse(opts, varargin) ;
+
+fn = @(roidb,img_idx,batch_pos,batch_neg)...
+    getBatch(roidb, img_idx, batch_pos, batch_neg, opts.sampling) ;
+[net,stats] = second_cnn_train_dag(net, roidb, fn, opts);
+
+v = VideoWriter('Deer.avi');
+filename = char(conf.imgList(1));
+I = imread(filename);
+frame = im2frame(I);
+
+open(v);
+writeVideo(v,frame);
+fid = fopen( 'Deer.txt', 'wt' );
+
+for test = 1:length(result_fusion)
+  [a1] = result_fusion(test,:);
+  fprintf( fid, '%f,%f,%f,%f\n', a1(1), a1(2), a1(3), a1(4));
+end
+fclose(fid);
+
+for test = 2:length(result_fusion)
+    filename = char(conf.imgList(test));
+    I = imread(filename);
+    
+    RGB = insertShape(I ,'rectangle', result_fusion(test,:),  'Color', 'red' ,'LineWidth',3);
+    RGB = insertShape(RGB ,'rectangle', result_mdnet(test,:),  'Color', 'green' ,'LineWidth',3);
+    RGB = insertShape(RGB ,'rectangle', result_tcnn(test,:),  'Color', 'blue' ,'LineWidth',3);
+    RGB = insertText(RGB, [10,10], test,'TextColor','black', 'FontSize', 30);
+    
+    frame = im2frame(RGB);
+    
+    writeVideo(v,frame);
+end
+close(v);
+end
+% -------------------------------------------------------------------------
+function [im,labels] = getBatch(roidb, img_idx, batch_pos, batch_neg, opts)
+% -------------------------------------------------------------------------
+image_paths = {roidb(img_idx).img_path};
+
+pos_boxes = cell2mat({roidb(img_idx).pos_boxes}');
+idx = randsample(size(pos_boxes,1),batch_pos);
+pos_boxes = pos_boxes(idx,:);
+pos_idx = floor((idx-1)/opts.posPerFrame)+1;
+
+neg_boxes = cell2mat({roidb(img_idx).neg_boxes}');
+idx = randsample(size(neg_boxes,1),batch_neg);
+neg_boxes = neg_boxes(idx,:);
+neg_idx = floor((idx-1)/opts.negPerFrame)+1;
+
+boxes = [pos_idx, pos_boxes; neg_idx, neg_boxes];
+
+im = get_batch(image_paths, boxes, opts, ...
+    'prefetch', nargout == 0) ;
+
+if(nargout > 0 && opts.flip)
+    flip_idx = find(randi([0 1],size(boxes,1),1));
+    for i=flip_idx
+        im(:,:,:,i) = flip(im(:,:,:,i),2);
+    end
+end
+
+labels = single([2*ones(numel(pos_idx),1);ones(numel(neg_idx),1)]);
+end
+
+function net = insertBNLayers(net)
+%INSERTBNLAYERS adds batch normalization to a network
+%  INSERTBNLAYERS(dagnet) inserts batch normalization
+%  layers directly after each convolutional layer in the
+%  the a DagNN network
+
+% return if the network already contains batch norm layers 
+for l = 1:numel(net.layers)
+    if isa(net.layers(l).block, 'dagnn.BatchNorm')
+        return;
+    end
+end
+
+% loop over the network and insert batch norm layers after 
+% convolutions
+layerOrder = net.getLayerExecutionOrder();
+for l = 20:layerOrder(end)
+    if isa(net.layers(l).block, 'dagnn.Conv') && ...
+            ~strcmp(net.layers(l).outputs, 'prediction')
+        net = addBatchNorm(net, l);
+    end
+end
+
+net.rebuild()
+
+
+function net = addBatchNorm(net, layerIndex)
+%ADDBATCHNORM adds a batch norm layer
+%    ADDBATCHNORM adds a batch layer to the network
+%    to a network at the index given by `layerIndex`
+
+% pair inputs and outputs to ensure a valid network
+inputs = net.layers(layerIndex).outputs;
+
+% find the number of channels produced by the previous layer
+numChannels = net.layers(layerIndex).block.size(4);
+
+outputs = sprintf('xbn%d',layerIndex);
+
+% Define the name and parameters for the new layer
+name = sprintf('bn%d', layerIndex);
+
+block = dagnn.BatchNorm();
+paramNames = {sprintf('%sm', name) ...
+              sprintf('%sb', name) ...
+              sprintf('%sx', name) };
+
+% add new layer to the network          
+net.addLayer(...
+    name, ...
+    block, ...
+    inputs, ...
+    outputs, ...
+    paramNames) ;
+
+
+% set mu (gain parameter)
+mIdx = net.getParamIndex(paramNames{1});
+net.params(mIdx).value = ones(numChannels, 1, 'single');
+net.params(mIdx).learningRate = 2;
+net.params(mIdx).weightDecay = 0;
+
+% set beta (bias parameter)
+bIdx = net.getParamIndex(paramNames{2});
+net.params(bIdx).value = zeros(numChannels, 1, 'single');
+net.params(bIdx).learningRate = 1;
+net.params(bIdx).weightDecay = 0;
+
+% set moments parameter
+xIdx = net.getParamIndex(paramNames{3});
+net.params(xIdx).value = zeros(numChannels, 2, 'single');
+net.params(xIdx).learningRate = 0.05;
+net.params(xIdx).weightDecay = 0;
+
+% modify the next layer to take the new inputs
+net.layers(layerIndex + 1).inputs = {outputs};
+end
+end
+
+

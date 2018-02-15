@@ -1,0 +1,6 @@
+[submodule "Trackers/MDNet"]
+	path = Trackers/MDNet
+	url = https://github.com/HyeonseobNam/MDNet
+[submodule "Trackers/Continous-ConvOp"]
+	path = Trackers/Continous-ConvOp
+	url = https://github.com/martin-danelljan/Continuous-ConvOp.git
